@@ -13,6 +13,8 @@ over the same core, not a replacement.
 
 import json
 import os
+import subprocess
+import sys
 import time
 import uuid
 
@@ -61,6 +63,66 @@ def flash(note: str | None) -> None:
 # --- SIDEBAR ----------------------------------------------------------------
 
 
+def _pick_folder_native() -> tuple[str | None, str | None]:
+    """
+    Open the operating system's native 'choose a directory' dialog.
+
+    Order of preference:
+      1. The desktop's own picker on Linux/BSD — zenity (GNOME & friends) or
+         kdialog (KDE). These are what Linux users expect and need no Python
+         GUI toolkit installed.
+      2. A tkinter dialog in a throwaway child process (Tk insists on owning
+         the main thread, which Streamlit's script runner is not).
+
+    Returns (path, problem); at most one is truthy. `path` is None when the
+    user cancels. `problem` explains why no dialog could open at all (missing
+    tkinter/zenity, headless host, …) so the caller can tell the user to type
+    the path manually.
+    """
+    # --- 1. desktop-native pickers (Linux/BSD) -----------------------------
+    if os.name != "nt" and sys.platform != "darwin":
+        for argv in (
+            ["zenity", "--file-selection", "--directory"],
+            ["kdialog", "--getexistingdirectory", os.path.expanduser("~")],
+        ):
+            try:
+                done = subprocess.run(argv, capture_output=True, text=True, timeout=300)
+            except (FileNotFoundError, PermissionError):
+                continue                        # tool not installed, try the next
+            except Exception as e:
+                return None, f"`{argv[0]}` failed to run ({e})."
+            if done.returncode == 0 and done.stdout.strip():
+                return done.stdout.strip(), None
+            if done.returncode != 0:
+                return None, None               # user closed the dialog
+
+    # --- 2. tkinter in a child process -------------------------------------
+    code = (
+        "import tkinter as tk\n"
+        "from tkinter import filedialog\n"
+        "root = tk.Tk()\n"
+        "root.withdraw()\n"
+        "root.attributes('-topmost', True)\n"   # don't hide behind the browser
+        "print(filedialog.askdirectory())\n"
+        "root.destroy()\n"
+    )
+    try:
+        done = subprocess.run(
+            [sys.executable, "-c", code],
+            capture_output=True, text=True, timeout=300,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+        )
+    except Exception as e:
+        return None, f"Couldn't open a folder dialog ({e})."
+
+    if done.stdout.strip():
+        return done.stdout.strip(), None
+    if "No module named 'tkinter'" in done.stderr:
+        return None, ("No folder picker found — install `python3-tk`, `zenity`, "
+                      "or `kdialog` (or type the path below).")
+    return None, None                           # user cancelled
+
+
 def render_workspace_panel(session: ChatSession) -> None:
     with st.container(border=True):
         #st.markdown("**📂 Workspace**")
@@ -74,13 +136,41 @@ def render_workspace_panel(session: ChatSession) -> None:
             st.session_state.show_new_project_input = True
 
         if st.session_state.get("show_new_project_input", False):
-            new_path = st.text_input(
-                "Absolute path for the new project:", key="new_proj_path_input"
+            if st.button("📁 Browse…", use_container_width=True,
+                         help="Open your operating system's folder picker"):
+                with st.spinner("Waiting for the folder dialog…"):
+                    picked, problem = _pick_folder_native()
+                if problem:
+                    st.warning(problem)
+                if picked:
+                    st.session_state.new_proj_base = picked
+                    # Bump the key so the Location widget below remounts with
+                    # the picked value instead of ignoring `value=`.
+                    st.session_state.new_proj_key = str(uuid.uuid4())
+                    st.rerun()
+
+            st.session_state.setdefault("new_proj_key", "initial")
+            base = st.text_input(
+                "Location", value=st.session_state.get("new_proj_base", ""),
+                key=f"new_proj_base_{st.session_state.new_proj_key}",
+                placeholder="Click 📁 Browse…, or paste a full path",
             )
+
+            folder_name = st.text_input(
+                "New folder name (blank = use the location above):",
+                key="new_proj_name_input", placeholder="my-new-project",
+            )
+            target = (
+                os.path.join(base.strip(), folder_name.strip())
+                if base.strip() and folder_name.strip() else base.strip()
+            )
+            if target:
+                st.caption(f"Will create / open: `{target}`")
+
             col1, col2 = st.columns(2)
-            if col1.button("Create Project"):
+            if col1.button("Create Project", type="primary", disabled=not base.strip()):
                 st.session_state.show_new_project_input = False
-                switch_workspace_environment(workspace.create_project(new_path))
+                switch_workspace_environment(workspace.create_project(target))
             if col2.button("Cancel Project"):
                 st.session_state.show_new_project_input = False
                 st.rerun()
