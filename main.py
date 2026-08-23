@@ -267,7 +267,7 @@ def run_shell(command):
 def chat_loop(selected_provider, selected_model):
     """Run the chat session. Returns 'switch' to pick a new model, or 'exit'."""
     print(f"\n=> Selected Model: [{selected_provider}] {selected_model}")
-    print("Tools enabled: get_current_time, calculate, read_file_tool")
+    print(f"Tools enabled: {', '.join([t['function']['name'] for t in TOOLS])}")
     print("Type your message below. Commands: '/exit' or '/quit' to exit, '/switch' to change model, '/clear' to clear history.")
     print("Shell: '!cmd' runs locally and adds the output to context, '!!cmd' runs locally and keeps it out of context.\n")
     print("Skills: '/skills' lists them, '/skill <name> [task]' loads one, '/skills reload' re-scans.")

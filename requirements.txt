@@ -1,0 +1,5 @@
+# Reconstructed by inspecting imports — the repo ships no requirements file.
+python-dotenv        # main.py: load_dotenv()
+tavily-python        # tools/web_search.py: TavilyClient
+streamlit            # app.py
+pytest               # test_smoke.py (dev only)
