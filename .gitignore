@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+.ruff_cache/
+.env
+discovered_models.json
+combined_app.py
+combine_py.py
+journal/
+skills/
+prompts/
+.chatbot/
+discovered_models.json
+.recent_projects.json
