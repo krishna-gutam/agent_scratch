@@ -11,6 +11,8 @@ The CLI (`python main.py`) still works untouched — this is a second frontend
 over the same core, not a replacement.
 """
 
+import base64
+import io
 import json
 import os
 import subprocess
@@ -19,6 +21,12 @@ import time
 import uuid
 
 import streamlit as st
+
+try:
+    from PIL import Image
+    HAS_PIL = True
+except ImportError:
+    HAS_PIL = False
 
 import authoring
 import backend
@@ -29,6 +37,78 @@ try:                                   # pip install streamlit-ace for the real 
     from streamlit_ace import st_ace
 except ImportError:
     st_ace = None
+
+
+# --- FILE UPLOAD HELPERS ----------------------------------------------------
+
+MAX_IMAGE_DIMENSION = 1024  # downscale long edge to this many px before sending
+MAX_TEXT_FILE_CHARS = 20_000_000  # truncate text/code file contents beyond this length
+
+IMAGE_EXTENSIONS = {"png", "jpg", "jpeg", "webp", "gif"}
+
+TEXT_EXTENSION_LANGS = {
+    "txt": "", "md": "markdown", "csv": "", "tsv": "",
+    "py": "python", "js": "javascript", "jsx": "jsx", "ts": "typescript", "tsx": "tsx",
+    "java": "java", "kt": "kotlin", "swift": "swift", "go": "go", "rs": "rust",
+    "c": "c", "h": "c", "cpp": "cpp", "cc": "cpp", "hpp": "cpp", "cs": "csharp",
+    "rb": "ruby", "php": "php", "pl": "perl", "lua": "lua", "r": "r", "m": "matlab",
+    "html": "html", "css": "css", "scss": "scss",
+    "json": "json", "yaml": "yaml", "yml": "yaml", "xml": "xml", "toml": "toml", "ini": "ini",
+    "sql": "sql", "sh": "bash", "bash": "bash",
+}
+TEXT_EXTENSIONS = set(TEXT_EXTENSION_LANGS)
+
+
+def file_extension(filename: str) -> str:
+    return filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+
+
+def is_image_file(filename: str) -> bool:
+    return file_extension(filename) in IMAGE_EXTENSIONS
+
+
+def read_text_file(uploaded_file) -> tuple[str, bool]:
+    """Decode an uploaded text/code file. Returns (text, was_truncated)."""
+    raw = uploaded_file.getvalue()
+    text = raw.decode("utf-8", errors="replace")
+    truncated = len(text) > MAX_TEXT_FILE_CHARS
+    if truncated:
+        text = text[:MAX_TEXT_FILE_CHARS]
+    return text, truncated
+
+
+def format_text_file_block(filename: str, text: str, truncated: bool) -> str:
+    lang = TEXT_EXTENSION_LANGS.get(file_extension(filename), "")
+    note = "\n*(truncated — file exceeds the size limit)*" if truncated else ""
+    return f"**📄 {filename}**\n```{lang}\n{text}\n```{note}"
+
+
+def encode_image_to_data_url(uploaded_file) -> str:
+    raw = uploaded_file.getvalue()
+
+    if not HAS_PIL:
+        mime = uploaded_file.type or "image/png"
+        b64 = base64.b64encode(raw).decode("utf-8")
+        return f"data:{mime};base64,{b64}"
+
+    image = Image.open(io.BytesIO(raw))
+    image.thumbnail((MAX_IMAGE_DIMENSION, MAX_IMAGE_DIMENSION))
+
+    buffer = io.BytesIO()
+    if image.mode == "RGBA":
+        image.save(buffer, format="PNG")
+        mime = "image/png"
+    else:
+        image.convert("RGB").save(buffer, format="JPEG", quality=85)
+        mime = "image/jpeg"
+
+    b64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
+    return f"data:{mime};base64,{b64}"
+
+
+def data_url_to_bytes(data_url: str) -> bytes:
+    _, b64data = data_url.split(",", 1)
+    return base64.b64decode(b64data)
 
 
 # --- SESSION WIRING ---------------------------------------------------------
@@ -836,6 +916,22 @@ def _render_bundled_editor(kind: str, slug: str) -> None:
 # --- CHAT -------------------------------------------------------------------
 
 
+def render_message_content(content) -> None:
+    """Render a message's content, whether it's plain text or a list of
+    OpenAI-style content parts (text / image_url)."""
+    if isinstance(content, list):
+        for part in content:
+            if part.get("type") == "text":
+                st.markdown(sanitize_content(part["text"]))
+            elif part.get("type") == "image_url":
+                try:
+                    st.image(data_url_to_bytes(part["image_url"]["url"]))
+                except Exception as e:
+                    st.caption(f"[Image display error: {e}]")
+    else:
+        st.markdown(sanitize_content(content))
+
+
 def render_transcript(session: ChatSession) -> None:
     """Chat history, rendered straight from the raw message list."""
     for msg in session.messages:
@@ -843,14 +939,14 @@ def render_transcript(session: ChatSession) -> None:
 
         if role == "user":
             with st.chat_message("user"):
-                st.markdown(sanitize_content(msg.get("content", "")))
+                render_message_content(msg.get("content", ""))
 
         elif role == "assistant":
-            content = sanitize_content(msg.get("content") or "")
+            content = msg.get("content") or ""
             # Only render if there is actual text (ignores silent tool calls)
-            if content.strip():
+            if isinstance(content, list) or (isinstance(content, str) and content.strip()):
                 with st.chat_message("assistant"):
-                    st.markdown(content)
+                    render_message_content(content)
             elif msg.get("tool_calls"):
                 with st.chat_message("assistant"):
                     names = ", ".join(c["function"]["name"] for c in msg["tool_calls"])
@@ -991,13 +1087,52 @@ def main() -> None:
         st.chat_input("Select a model to start chatting...", disabled=True)
         return
 
-    user_text = st.chat_input(
-        "Message, !shell command, /skill <name> or /prompt <name> …"
+    user_prompt = st.chat_input(
+        "Message, !shell command, /skill <name> or /prompt <name> … (use + to attach files)",
+        accept_file="multiple",
+        file_type=sorted(IMAGE_EXTENSIONS | TEXT_EXTENSIONS),
     )
 
-    if user_text:
-        flash(session.submit(user_text))
-        st.rerun()
+    if user_prompt:
+        user_text = user_prompt.text if hasattr(user_prompt, "text") else str(user_prompt)
+        attached_files = user_prompt.files if hasattr(user_prompt, "files") else []
+
+        image_parts = []
+        text_blocks = []
+        for f in attached_files:
+            if is_image_file(f.name):
+                image_parts.append({
+                    "type": "image_url",
+                    "image_url": {"url": encode_image_to_data_url(f)},
+                })
+            else:
+                text, truncated = read_text_file(f)
+                text_blocks.append(format_text_file_block(f.name, text, truncated))
+
+        full_text = user_text
+        if text_blocks:
+            full_text = (full_text + "\n\n" if full_text else "") + "\n\n".join(text_blocks)
+
+        if image_parts:
+            content = []
+            if full_text:
+                content.append({"type": "text", "text": full_text})
+            content.extend(image_parts)
+        else:
+            content = full_text
+
+        # If there are image parts, session.submit expects text or we can pass structured content.
+        # Let's handle structured content or submit via session.
+        if isinstance(content, list) or image_parts:
+            # Directly append and trigger model step if it's structured image content
+            session.messages.append({"role": "user", "content": content})
+            session.busy = True
+            session.last_error = None
+            session._save()
+            st.rerun()
+        else:
+            flash(session.submit(full_text))
+            st.rerun()
 
 
 if __name__ == "__main__":
